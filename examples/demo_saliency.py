@@ -1,4 +1,9 @@
-"""Demo: hierarchical occlusion saliency on a support-ticket routing decision."""
+"""Demo: hierarchical occlusion saliency on a loan application review decision.
+
+Designed to show a realistic importance distribution across multiple segments.
+The decision (approve / flag / request_docs) depends on partial signals from
+several sources, so masking each segment causes a different drop in confidence.
+"""
 
 import asyncio
 import os
@@ -12,70 +17,116 @@ PROXY_URL = "https://proxy.vectorinstitute.ai/v1"
 API_KEY = os.environ["VECTOR_API_KEY"]
 MODEL = "Qwen3-Coder-Next"
 
-# --- Context segments (what the agent sees when deciding which tool to call) ---
+# --- Context segments ---
+# Each segment contributes partial evidence. No single segment is decisive,
+# so masking them produces a spread of importance scores rather than 0/1.
 
 SEGMENTS = [
     Segment(
         id="system",
-        content="You are a support agent. Escalate tickets that are urgent or have been unresolved for more than 48 hours.",
+        content=(
+            "You are a loan underwriting assistant. "
+            "Approve applications that clearly meet all criteria. "
+            "Flag for manual review if any criterion is borderline. "
+            "Request more documents if required information is missing."
+        ),
         label="System prompt",
         level=SegmentLevel.DOCUMENT,
     ),
     Segment(
-        id="user_msg",
-        content="My payment has been failing for 3 days and my account is now locked. I need this fixed urgently.",
-        label="User message",
+        id="application",
+        content=(
+            "Applicant: Jordan Lee. "
+            "Requested loan: $42,000. "
+            "Stated annual income: $68,000. "
+            "Credit score: 694. "
+            "Employment: salaried, 2.5 years at current employer."
+        ),
+        label="Loan application",
         level=SegmentLevel.DOCUMENT,
     ),
     Segment(
-        id="doc_1",
-        content="Escalation policy: accounts locked for more than 48 hours require immediate human review. Do not attempt automated resolution.",
-        label="Retrieved doc: escalation policy",
+        id="credit_policy",
+        content=(
+            "Credit score policy: scores above 720 qualify for standard approval. "
+            "Scores between 660 and 720 require manual review. "
+            "Scores below 660 are declined automatically."
+        ),
+        label="Policy: credit score",
         level=SegmentLevel.DOCUMENT,
     ),
     Segment(
-        id="doc_2",
-        content="Payment retry guide: ask the user to clear browser cache and retry. Most payment failures resolve within 24 hours.",
-        label="Retrieved doc: payment retry guide",
+        id="income_policy",
+        content=(
+            "Debt-to-income policy: the requested loan must not exceed 65% of annual income. "
+            "Borderline cases (60-65%) require a supervisor sign-off."
+        ),
+        label="Policy: income ratio",
+        level=SegmentLevel.DOCUMENT,
+    ),
+    Segment(
+        id="employment_policy",
+        content=(
+            "Employment policy: applicants must have at least 12 months of continuous employment. "
+            "Less than 24 months at the current employer is considered borderline."
+        ),
+        label="Policy: employment",
+        level=SegmentLevel.DOCUMENT,
+    ),
+    Segment(
+        id="prior_history",
+        content=(
+            "Credit history: no prior defaults. "
+            "One missed payment 18 months ago, now resolved. "
+            "No open collections or bankruptcies."
+        ),
+        label="Prior credit history",
         level=SegmentLevel.DOCUMENT,
     ),
 ]
 
-# --- Full messages for the decision call ---
+# --- Messages ---
 
 MESSAGES = [
     {"role": "system", "content": SEGMENTS[0].content},
-    {"role": "user", "content": SEGMENTS[1].content},
     {
         "role": "user",
-        "content": (f"Context documents:\n\n[Doc 1] {SEGMENTS[2].content}\n\n[Doc 2] {SEGMENTS[3].content}"),
+        "content": (
+            f"Please review this loan application and decide on the next action.\n\n"
+            f"Application:\n{SEGMENTS[1].content}\n\n"
+            f"Relevant policies and history:\n"
+            f"[Credit policy] {SEGMENTS[2].content}\n"
+            f"[Income policy] {SEGMENTS[3].content}\n"
+            f"[Employment policy] {SEGMENTS[4].content}\n"
+            f"[Credit history] {SEGMENTS[5].content}"
+        ),
     },
 ]
 
-# --- Tool definitions ---
+# --- Tools ---
 
 TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "escalate_to_human",
-            "description": "Escalate the ticket to a human support agent.",
+            "name": "approve_loan",
+            "description": "Approve the loan application. All criteria are clearly met.",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "send_retry_instructions",
-            "description": "Send automated payment retry instructions to the user.",
+            "name": "flag_for_manual_review",
+            "description": "Flag the application for manual review by a senior underwriter. Use when any criterion is borderline.",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "auto_resolve",
-            "description": "Mark the ticket as resolved automatically.",
+            "name": "request_additional_documents",
+            "description": "Ask the applicant for missing or incomplete documentation before proceeding.",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
@@ -85,10 +136,14 @@ TOOLS = [
 async def main() -> None:
     """Run the saliency demo."""
     client = AsyncOpenAI(base_url=PROXY_URL, api_key=API_KEY)
-    engine = SaliencyEngine(client=client, model=MODEL, top_k=2)
+    # n_samples=5: run each masked context 5 times at temperature=0.7 and
+    # measure P(original_decision | masked). Produces a genuine distribution
+    # rather than near-binary logprob scores.
+    engine = SaliencyEngine(client=client, model=MODEL, top_k=2, n_samples=5)
 
     print(f"Model: {MODEL}")
-    print(f"Running hierarchical occlusion on {len(SEGMENTS)} segments...\n")
+    print(f"Segments: {len(SEGMENTS)}")
+    print("Running hierarchical occlusion (n_samples=5, temperature=0.7)...\n")
 
     result = await engine.explain_async(
         messages=MESSAGES,  # type: ignore[arg-type]
@@ -96,23 +151,24 @@ async def main() -> None:
         tools=TOOLS,  # type: ignore[arg-type]
     )
 
-    print(f"Original decision: {result.original_decision}\n")
-    print("=== Pass 1: Segment-level importance ===")
+    print(f"Decision: {result.original_decision}\n")
+
+    print("=== Pass 1: segment-level importance ===")
     doc_scores = [s for s in result.top if "__s" not in s.segment_id]
     for score in doc_scores:
-        bar = "█" * int(score.importance * 20)
-        changed = " ← flipped" if score.decision_changed else ""
-        print(f"  {score.label:<40} {score.importance:.3f}  {bar}{changed}")
+        bar = "█" * int(score.importance * 30)
+        changed = "  [flipped]" if score.decision_changed else ""
+        print(f"  {score.label:<38} {score.importance:.3f}  {bar}{changed}")
 
-    print("\n=== Pass 2: Sentence-level (top segments drilled in) ===")
+    print("\n=== Pass 2: sentence-level (top segments) ===")
     sent_scores = [s for s in result.top if "__s" in s.segment_id]
     if sent_scores:
         for score in sent_scores:
-            bar = "█" * int(score.importance * 20)
-            changed = " ← flipped" if score.decision_changed else ""
-            print(f"  {score.label[:60]:<62} {score.importance:.3f}  {bar}{changed}")
+            bar = "█" * int(score.importance * 30)
+            changed = "  [flipped]" if score.decision_changed else ""
+            print(f"  {score.label[:55]:<57} {score.importance:.3f}  {bar}{changed}")
     else:
-        print("  (no multi-sentence segments found)")
+        print("  (top segments were single sentences)")
 
     print(f"\n{result.summary()}")
 
