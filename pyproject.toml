@@ -1,6 +1,6 @@
 [project]
 name = "motive"
-version = "0.0.1"
+version = "0.0.2"
 description = "Answer 'why did the agent do that?' with saliency, rationale, and counterfactuals"
 readme = "README.md"
 requires-python = ">=3.11"
