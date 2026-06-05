@@ -7,7 +7,6 @@ requires-python = ">=3.11"
 license = { file = "LICENSE" }
 dependencies = [
     "openai>=1.82.0",
-    "circuit-tracer>=0.5.0",
 ]
 
 [dependency-groups]
