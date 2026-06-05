@@ -69,6 +69,51 @@ def _text_response(text: str) -> MagicMock:
     return resp
 
 
+def _make_engine(n_samples: int = 1, top_k: int = 2) -> tuple[SaliencyEngine, AsyncMock]:
+    """Return an engine wired to a mock OpenAI client."""
+    client = MagicMock()
+    client.chat = MagicMock()
+    client.chat.completions = MagicMock()
+    client.chat.completions.create = AsyncMock()
+    return SaliencyEngine(client=client, model="test-model", top_k=top_k, n_samples=n_samples), client
+
+
+def _sample_segments() -> list[Segment]:
+    return [
+        Segment(id="system", content="You are a support agent. Escalate urgent issues.", label="System prompt"),
+        Segment(id="user_msg", content="My account is locked for 3 days.", label="User message"),
+        Segment(id="doc_1", content="Locked accounts require human review.", label="Escalation policy"),
+    ]
+
+
+def _sample_messages() -> list[dict]:
+    return [
+        {"role": "system", "content": "You are a support agent. Escalate urgent issues."},
+        {"role": "user", "content": "My account is locked for 3 days. Locked accounts require human review."},
+    ]
+
+
+def _sample_tools() -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "escalate_to_human",
+                "description": "Escalate.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "send_reminder",
+                "description": "Send reminder.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+    ]
+
+
 # ---------------------------------------------------------------------------
 # _extract_tool_name
 # ---------------------------------------------------------------------------
@@ -105,7 +150,6 @@ class TestLogprobForTool:
         assert result == pytest.approx(-0.5)
 
     def test_multi_token_match_sums_logprobs(self) -> None:
-        # "escalate_to_human" split as "escal" + "ate" + "_to" + "_human"
         logprobs = [
             {"token": "<function=", "logprob": -0.01},
             {"token": "escal", "logprob": -0.1},
@@ -130,6 +174,16 @@ class TestLogprobForTool:
     def test_returns_none_when_logprob_content_empty(self) -> None:
         resp = _tool_response("tool_a", logprobs=[])
         assert _logprob_for_tool(resp, "tool_a") is None
+
+    def test_partial_overlap_tokens_included(self) -> None:
+        # Token spans: "too" covers start of "tool", "_x" covers end
+        logprobs = [
+            {"token": "too", "logprob": -0.3},
+            {"token": "l_x", "logprob": -0.4},
+        ]
+        resp = _tool_response("tool_x", logprobs)
+        result = _logprob_for_tool(resp, "tool_x")
+        assert result == pytest.approx(-0.3 + -0.4)
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +240,15 @@ class TestMaskMessages:
         _mask_messages(messages, segments, mask_idx=0)
         assert messages[0]["content"] == original_content
 
+    def test_masks_only_first_occurrence(self) -> None:
+        segments = [Segment(id="s", content="repeat")]
+        messages = [{"role": "user", "content": "repeat and repeat again"}]
+        masked = _mask_messages(messages, segments, mask_idx=0)
+        content = masked[0]["content"]
+        assert "[CONTENT REDACTED]" in content
+        assert content.count("[CONTENT REDACTED]") == 1
+        assert "repeat again" in content
+
 
 # ---------------------------------------------------------------------------
 # _split_sentences
@@ -217,6 +280,10 @@ class TestSplitSentences:
     def test_filters_whitespace_only_parts(self) -> None:
         result = _split_sentences("  First.   Second.  ")
         assert all(s.strip() for s in result)
+
+    def test_three_sentences(self) -> None:
+        result = _split_sentences("One. Two. Three.")
+        assert len(result) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -259,62 +326,23 @@ class TestNormalise:
         normalised = _normalise(scores)
         assert {s.segment_id for s in normalised} == {"x", "y"}
 
+    def test_single_nonzero_score_becomes_one(self) -> None:
+        scores = [self._score("a", 0.0), self._score("b", 3.7)]
+        normalised = _normalise(scores)
+        by_id = {s.segment_id: s.importance for s in normalised}
+        assert by_id["b"] == pytest.approx(1.0)
+        assert by_id["a"] == pytest.approx(0.0)
+
 
 # ---------------------------------------------------------------------------
-# SaliencyEngine — async, mocked client
+# SaliencyEngine (n_samples=1, logprob mode)
 # ---------------------------------------------------------------------------
-
-
-def _make_engine() -> tuple[SaliencyEngine, AsyncMock]:
-    """Return an engine wired to a mock OpenAI client."""
-    client = MagicMock()
-    client.chat = MagicMock()
-    client.chat.completions = MagicMock()
-    client.chat.completions.create = AsyncMock()
-    return SaliencyEngine(client=client, model="test-model", top_k=2), client
-
-
-def _sample_segments() -> list[Segment]:
-    return [
-        Segment(id="system", content="You are a support agent. Escalate urgent issues.", label="System prompt"),
-        Segment(id="user_msg", content="My account is locked for 3 days.", label="User message"),
-        Segment(id="doc_1", content="Locked accounts require human review.", label="Escalation policy"),
-    ]
-
-
-def _sample_messages() -> list[dict]:
-    return [
-        {"role": "system", "content": "You are a support agent. Escalate urgent issues."},
-        {"role": "user", "content": "My account is locked for 3 days. Locked accounts require human review."},
-    ]
-
-
-def _sample_tools() -> list[dict]:
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": "escalate_to_human",
-                "description": "Escalate.",
-                "parameters": {"type": "object", "properties": {}, "required": []},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "send_reminder",
-                "description": "Send reminder.",
-                "parameters": {"type": "object", "properties": {}, "required": []},
-            },
-        },
-    ]
 
 
 @pytest.mark.asyncio
 class TestSaliencyEngineAsync:
     async def test_returns_saliency_result_with_correct_decision(self) -> None:
         engine, client = _make_engine()
-        # All calls return the same tool — no flips
         client.chat.completions.create.return_value = _tool_response("escalate_to_human")
 
         result = await engine.explain_async(
@@ -328,22 +356,17 @@ class TestSaliencyEngineAsync:
 
     async def test_flipped_segment_gets_high_importance(self) -> None:
         engine, client = _make_engine()
-        segments = _sample_segments()
-        responses = []
-        # Original call
-        responses.append(_tool_response("escalate_to_human"))
-        # Masking system → same
-        responses.append(_tool_response("escalate_to_human"))
-        # Masking user_msg → flips
-        responses.append(_tool_response("send_reminder"))
-        # Masking doc_1 → same
-        responses.append(_tool_response("escalate_to_human"))
-
+        responses = [
+            _tool_response("escalate_to_human"),  # original
+            _tool_response("escalate_to_human"),  # mask system → same
+            _tool_response("send_reminder"),  # mask user_msg → flips
+            _tool_response("escalate_to_human"),  # mask doc_1 → same
+        ]
         client.chat.completions.create.side_effect = responses
 
         result = await engine.explain_async(
             messages=_sample_messages(),  # type: ignore[arg-type]
-            segments=segments,
+            segments=_sample_segments(),
             tools=_sample_tools(),  # type: ignore[arg-type]
         )
 
@@ -361,15 +384,10 @@ class TestSaliencyEngineAsync:
         ]
         messages = [{"role": "user", "content": "important context irrelevant context"}]
 
-        lp_tokens = [
-            {"token": "tool", "logprob": -0.01},
-            {"token": "_a", "logprob": -0.01},
-        ]
-        # Original: logprob of "tool_a" = -0.02
-        original_resp = _tool_response("tool_a", lp_tokens)
-        # Mask seg_a: logprob drops to -1.5 → importance = -0.02 - (-1.5) = 1.48
+        original_resp = _tool_response(
+            "tool_a", [{"token": "tool", "logprob": -0.01}, {"token": "_a", "logprob": -0.01}]
+        )
         masked_a = _tool_response("tool_a", [{"token": "tool", "logprob": -0.8}, {"token": "_a", "logprob": -0.7}])
-        # Mask seg_b: logprob barely changes → low importance
         masked_b = _tool_response("tool_a", [{"token": "tool", "logprob": -0.01}, {"token": "_a", "logprob": -0.02}])
 
         client.chat.completions.create.side_effect = [original_resp, masked_a, masked_b]
@@ -384,9 +402,26 @@ class TestSaliencyEngineAsync:
         by_id = {s.segment_id: s for s in pass1}
         assert by_id["seg_a"].importance > by_id["seg_b"].importance
 
+    async def test_importance_clipped_at_zero_when_masked_logprob_higher(self) -> None:
+        engine, client = _make_engine()
+        segments = [Segment(id="seg_a", content="context", label="A")]
+        messages = [{"role": "user", "content": "context"}]
+
+        # Original logprob lower than masked (masked is more confident) — drop should clip to 0
+        original_resp = _tool_response("tool_a", [{"token": "tool_a", "logprob": -1.0}])
+        masked_resp = _tool_response("tool_a", [{"token": "tool_a", "logprob": -0.1}])
+        client.chat.completions.create.side_effect = [original_resp, masked_resp]
+
+        result = await engine.explain_async(
+            messages=messages,  # type: ignore[arg-type]
+            segments=segments,
+            tools=_sample_tools(),  # type: ignore[arg-type]
+        )
+
+        assert result.scores[0].importance == pytest.approx(0.0)
+
     async def test_no_pass2_when_all_segments_zero_importance(self) -> None:
         engine, client = _make_engine()
-        # Every call returns the same tool — no flips, no logprobs → all zero
         client.chat.completions.create.return_value = _tool_response("escalate_to_human")
 
         result = await engine.explain_async(
@@ -395,8 +430,7 @@ class TestSaliencyEngineAsync:
             tools=_sample_tools(),  # type: ignore[arg-type]
         )
 
-        sentence_scores = [s for s in result.scores if "__s" in s.segment_id]
-        assert sentence_scores == []
+        assert [s for s in result.scores if "__s" in s.segment_id] == []
 
     async def test_pass2_only_drills_into_nonzero_segments(self) -> None:
         engine, client = _make_engine()
@@ -408,17 +442,13 @@ class TestSaliencyEngineAsync:
             {"role": "system", "content": "You are an agent."},
             {"role": "user", "content": "Urgent issue. Account locked."},
         ]
-
-        responses = []
-        # Original
-        responses.append(_tool_response("escalate_to_human"))
-        # Pass 1: mask system → same; mask user_msg → flips
-        responses.append(_tool_response("escalate_to_human"))
-        responses.append(_tool_response("send_reminder"))
-        # Pass 2: two sentences in user_msg
-        responses.append(_tool_response("escalate_to_human"))  # mask "Urgent issue."
-        responses.append(_tool_response("send_reminder"))  # mask "Account locked."
-
+        responses = [
+            _tool_response("escalate_to_human"),  # original
+            _tool_response("escalate_to_human"),  # mask system → same
+            _tool_response("send_reminder"),  # mask user_msg → flips
+            _tool_response("escalate_to_human"),  # pass2: mask "Urgent issue."
+            _tool_response("send_reminder"),  # pass2: mask "Account locked."
+        ]
         client.chat.completions.create.side_effect = responses
 
         result = await engine.explain_async(
@@ -428,23 +458,20 @@ class TestSaliencyEngineAsync:
         )
 
         sentence_scores = [s for s in result.scores if "__s" in s.segment_id]
-        # Only user_msg should be drilled (system had 0 importance)
         assert all(s.segment_id.startswith("user_msg") for s in sentence_scores)
         assert len(sentence_scores) == 2
 
-    async def test_call_count_is_1_plus_n_segments_for_pass1(self) -> None:
+    async def test_call_count_is_1_plus_n_segments_minimum(self) -> None:
         engine, client = _make_engine()
-        segments = _sample_segments()  # 3 segments
         client.chat.completions.create.return_value = _tool_response("escalate_to_human")
 
         await engine.explain_async(
             messages=_sample_messages(),  # type: ignore[arg-type]
-            segments=segments,
+            segments=_sample_segments(),  # 3 segments
             tools=_sample_tools(),  # type: ignore[arg-type]
         )
 
-        # 1 original + 3 masked = 4 calls minimum (plus any pass2 calls)
-        assert client.chat.completions.create.call_count >= 4
+        assert client.chat.completions.create.call_count >= 4  # 1 original + 3 masked
 
 
 class TestSaliencyEngineSync:
@@ -460,3 +487,127 @@ class TestSaliencyEngineSync:
 
         assert result.original_decision == "escalate_to_human"
         assert len(result.scores) > 0
+
+
+# ---------------------------------------------------------------------------
+# SaliencyEngine (n_samples>1, sampling mode)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSaliencyEngineSamplingMode:
+    async def test_sampling_mode_uses_probability_drop(self) -> None:
+        engine, client = _make_engine(n_samples=4)
+        segments = [
+            Segment(id="seg_a", content="key context", label="A"),
+            Segment(id="seg_b", content="irrelevant", label="B"),
+        ]
+        messages = [{"role": "user", "content": "key context irrelevant"}]
+
+        # Original tool determined via _get_tool (1 call at temp=0)
+        # Then _sample_probability for original: 4 calls (all return tool_a) → P=1.0
+        # Mask seg_a: 4 calls → 1 returns tool_a → P=0.25 → importance=0.75
+        # Mask seg_b: 4 calls → all return tool_a → P=1.0 → importance=0.0
+        responses = (
+            [_tool_response("tool_a")]  # _get_tool
+            + [_tool_response("tool_a")] * 4  # original probability sampling
+            + [
+                _tool_response("tool_a"),
+                _tool_response("send_reminder"),
+                _tool_response("send_reminder"),
+                _tool_response("send_reminder"),
+            ]  # mask seg_a
+            + [_tool_response("tool_a")] * 4  # mask seg_b
+        )
+        client.chat.completions.create.side_effect = responses
+
+        result = await engine.explain_async(
+            messages=messages,  # type: ignore[arg-type]
+            segments=segments,
+            tools=_sample_tools(),  # type: ignore[arg-type]
+        )
+
+        pass1 = [s for s in result.scores if "__s" not in s.segment_id]
+        by_id = {s.segment_id: s for s in pass1}
+        assert by_id["seg_a"].importance > by_id["seg_b"].importance
+
+    async def test_sampling_mode_importance_proportional_to_prob_drop(self) -> None:
+        engine, client = _make_engine(n_samples=4)
+        segments = [Segment(id="seg_a", content="context", label="A")]
+        messages = [{"role": "user", "content": "context"}]
+
+        # Original: P=1.0 (4/4 match)
+        # Mask seg_a: P=0.5 (2/4 match) → raw importance = 0.5
+        responses = (
+            [_tool_response("tool_a")]  # _get_tool
+            + [_tool_response("tool_a")] * 4  # original probability
+            + [
+                _tool_response("tool_a"),
+                _tool_response("tool_a"),
+                _tool_response("send_reminder"),
+                _tool_response("send_reminder"),
+            ]  # mask
+        )
+        client.chat.completions.create.side_effect = responses
+
+        result = await engine.explain_async(
+            messages=messages,  # type: ignore[arg-type]
+            segments=segments,
+            tools=_sample_tools(),  # type: ignore[arg-type]
+        )
+
+        # Only one segment, normalises to 1.0 regardless of raw value
+        assert result.scores[0].importance == pytest.approx(1.0)
+
+    async def test_sampling_mode_decision_unchanged_when_prob_majority_same(self) -> None:
+        engine, client = _make_engine(n_samples=4)
+        segments = [Segment(id="seg_a", content="context", label="A")]
+        messages = [{"role": "user", "content": "context"}]
+
+        # Mask: 3/4 still return tool_a → majority same → decision_changed=False
+        responses = (
+            [_tool_response("tool_a")]  # _get_tool
+            + [_tool_response("tool_a")] * 4  # original probability
+            + [
+                _tool_response("tool_a"),
+                _tool_response("tool_a"),
+                _tool_response("tool_a"),
+                _tool_response("send_reminder"),
+            ]
+        )
+        client.chat.completions.create.side_effect = responses
+
+        result = await engine.explain_async(
+            messages=messages,  # type: ignore[arg-type]
+            segments=segments,
+            tools=_sample_tools(),  # type: ignore[arg-type]
+        )
+
+        assert result.scores[0].decision_changed is False
+
+    async def test_sampling_mode_call_count(self) -> None:
+        # n_samples=3, 2 segments:
+        # 1 _get_tool + 3 original_prob + (3 mask_seg_a + 3 mask_seg_b) = 10 calls
+        engine, client = _make_engine(n_samples=3)
+        segments = [
+            Segment(id="seg_a", content="a", label="A"),
+            Segment(id="seg_b", content="b", label="B"),
+        ]
+        messages = [{"role": "user", "content": "a b"}]
+        client.chat.completions.create.return_value = _tool_response("tool_a")
+
+        await engine.explain_async(
+            messages=messages,  # type: ignore[arg-type]
+            segments=segments,
+            tools=_sample_tools(),  # type: ignore[arg-type]
+        )
+
+        assert client.chat.completions.create.call_count == 10
+
+    async def test_n_samples_default_is_1(self) -> None:
+        engine, _ = _make_engine()
+        assert engine.n_samples == 1
+
+    async def test_sample_temperature_default(self) -> None:
+        engine, _ = _make_engine()
+        assert engine.sample_temperature == pytest.approx(0.7)

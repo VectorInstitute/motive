@@ -29,7 +29,7 @@ def _extract_tool_name(response: Any) -> str:
 def _logprob_for_tool(response: Any, tool_name: str) -> float | None:
     """Sum logprobs over the tokens that spell out `tool_name` in the response.
 
-    Tool names are multi-token (e.g. "escalate_to_human" → ["escal","ate","_to","_human"]),
+    Tool names are multi-token (e.g. "escalate_to_human" -> ["escal","ate","_to","_human"]),
     so we reconstruct the full generated string, locate the tool name span, and sum
     the logprobs of every token that overlaps with it.
     """
@@ -107,9 +107,20 @@ class SaliencyEngine:
     Pass 1 masks at segment (document/message) level.
     Pass 2 drills into the top_k segments at sentence level.
 
-    Importance is the drop in log-probability of the original tool choice
-    when a segment is masked.  Falls back to binary (flipped = 1.0,
-    unchanged = 0.0) when logprobs are unavailable.
+    Scoring modes
+    -------------
+    n_samples=1 (default):
+        Single deterministic run (temperature=0). Importance = drop in
+        log-probability of the original tool when the segment is masked.
+        Fast but can produce near-binary scores when the model is very confident.
+
+    n_samples>1:
+        Monte Carlo sampling (temperature=sample_temperature). Runs each
+        masked context n_samples times and measures how often the original
+        decision survives. Importance = P(original | full) - P(original | masked).
+        Slower but produces a genuine probability distribution (e.g. 0.0, 0.2,
+        0.4, 0.6, 0.8, 1.0 with n_samples=5). Use this when logprob drops are
+        too small to distinguish importance levels.
     """
 
     def __init__(
@@ -117,10 +128,14 @@ class SaliencyEngine:
         client: AsyncOpenAI,
         model: str,
         top_k: int = _TOP_K_DEFAULT,
+        n_samples: int = 1,
+        sample_temperature: float = 0.7,
     ) -> None:
         self.client = client
         self.model = model
         self.top_k = top_k
+        self.n_samples = n_samples
+        self.sample_temperature = sample_temperature
 
     def explain(
         self,
@@ -139,16 +154,24 @@ class SaliencyEngine:
         tools: list[ChatCompletionToolParam],
         tool_choice: ToolChoice = "auto",
     ) -> SaliencyResult:
-        """Async entry point."""
-        original_resp = await self._call(messages, tools, tool_choice, logprobs=True)
-        original_tool = _extract_tool_name(original_resp)
-        original_lp = _logprob_for_tool(original_resp, original_tool)
+        """Run explanation asynchronously."""
+        if self.n_samples > 1:
+            original_prob = await self._sample_probability(messages, tools, tool_choice)
+            original_tool = await self._get_tool(messages, tools, tool_choice)
+            original_lp = None
+        else:
+            original_resp = await self._call(messages, tools, tool_choice, logprobs=True)
+            original_tool = _extract_tool_name(original_resp)
+            original_lp = _logprob_for_tool(original_resp, original_tool)
+            original_prob = 1.0
 
         # Pass 1: segment level
-        pass1 = await self._occlusion_pass(messages, segments, tools, tool_choice, original_tool, original_lp)
+        pass1 = await self._occlusion_pass(
+            messages, segments, tools, tool_choice, original_tool, original_lp, original_prob
+        )
         pass1 = _normalise(pass1)
 
-        # Pass 2: sentence level on top_k segments that actually had non-zero importance
+        # Pass 2: sentence level on top_k segments with non-zero importance
         top_ids = {
             s.segment_id
             for s in sorted(pass1, key=lambda s: s.importance, reverse=True)[: self.top_k]
@@ -171,7 +194,7 @@ class SaliencyEngine:
                 for i, s in enumerate(sentences)
             ]
             sub_scores = await self._occlusion_pass(
-                messages, sub_segments, tools, tool_choice, original_tool, original_lp
+                messages, sub_segments, tools, tool_choice, original_tool, original_lp, original_prob
             )
             pass2.extend(_normalise(sub_scores))
 
@@ -189,9 +212,10 @@ class SaliencyEngine:
         tool_choice: ToolChoice,
         original_tool: str,
         original_lp: float | None,
+        original_prob: float,
     ) -> list[SaliencyScore]:
         tasks = [
-            self._score_segment(messages, segments, i, tools, tool_choice, original_tool, original_lp)
+            self._score_segment(messages, segments, i, tools, tool_choice, original_tool, original_lp, original_prob)
             for i in range(len(segments))
         ]
         return list(await asyncio.gather(*tasks))
@@ -205,20 +229,26 @@ class SaliencyEngine:
         tool_choice: ToolChoice,
         original_tool: str,
         original_lp: float | None,
+        original_prob: float,
     ) -> SaliencyScore:
         masked_msgs = _mask_messages(messages, segments, mask_idx)
-        resp = await self._call(masked_msgs, tools, tool_choice, logprobs=True)
-        masked_tool = _extract_tool_name(resp)
 
-        if original_lp is not None:
-            masked_lp = _logprob_for_tool(resp, original_tool)
-            importance = (
-                max(0.0, original_lp - masked_lp)
-                if masked_lp is not None
-                else (1.0 if masked_tool != original_tool else 0.0)
-            )
+        if self.n_samples > 1:
+            masked_prob = await self._sample_probability(masked_msgs, tools, tool_choice, target_tool=original_tool)
+            importance = max(0.0, original_prob - masked_prob)
+            masked_tool = original_tool if masked_prob >= 0.5 else "other"
         else:
-            importance = 1.0 if masked_tool != original_tool else 0.0
+            resp = await self._call(masked_msgs, tools, tool_choice, logprobs=True)
+            masked_tool = _extract_tool_name(resp)
+            if original_lp is not None:
+                masked_lp = _logprob_for_tool(resp, original_tool)
+                importance = (
+                    max(0.0, original_lp - masked_lp)
+                    if masked_lp is not None
+                    else (1.0 if masked_tool != original_tool else 0.0)
+                )
+            else:
+                importance = 1.0 if masked_tool != original_tool else 0.0
 
         seg = segments[mask_idx]
         return SaliencyScore(
@@ -230,12 +260,46 @@ class SaliencyEngine:
             masked_decision=masked_tool,
         )
 
+    async def _sample_probability(
+        self,
+        messages: list[ChatCompletionMessageParam],
+        tools: list[ChatCompletionToolParam],
+        tool_choice: ToolChoice,
+        target_tool: str | None = None,
+    ) -> float:
+        """Estimate P(target_tool | messages) via n_samples draws at sample_temperature."""
+        resps = await asyncio.gather(
+            *[
+                self._call(messages, tools, tool_choice, temperature=self.sample_temperature)
+                for _ in range(self.n_samples)
+            ]
+        )
+        if target_tool is None:
+            # First call: use the majority decision as target
+            target_tool = max(
+                {_extract_tool_name(r) for r in resps},
+                key=lambda t: sum(1 for r in resps if _extract_tool_name(r) == t),
+            )
+        matches = sum(1 for r in resps if _extract_tool_name(r) == target_tool)
+        return matches / self.n_samples
+
+    async def _get_tool(
+        self,
+        messages: list[ChatCompletionMessageParam],
+        tools: list[ChatCompletionToolParam],
+        tool_choice: ToolChoice,
+    ) -> str:
+        """Get the deterministic tool choice (temperature=0) for the original context."""
+        resp = await self._call(messages, tools, tool_choice)
+        return _extract_tool_name(resp)
+
     async def _call(
         self,
         messages: list[ChatCompletionMessageParam],
         tools: list[ChatCompletionToolParam],
         tool_choice: ToolChoice,
         logprobs: bool = False,
+        temperature: float = 0.0,
     ) -> Any:
         return await self.client.chat.completions.create(
             model=self.model,
@@ -244,5 +308,5 @@ class SaliencyEngine:
             tool_choice=tool_choice,
             logprobs=logprobs,
             top_logprobs=5 if logprobs else None,
-            temperature=0,
+            temperature=temperature,
         )
